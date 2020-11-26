@@ -345,6 +345,7 @@ struct link {
     struct link *prev;     // Previous link in the chain
     struct link *next;     // Next link in the chain
     struct lock_t lock;    // Lock
+    size_t size;           // Size of the segment
     void *lock_owner;      // Identifier of the lock owner
     uint8_t status;        // Whether this blocks need to be added or removed in case of rollback and commit
 //    uint32_t ts;           // Timestamp
@@ -392,7 +393,7 @@ static const tx_t read_write_tx = UINTPTR_MAX - 11;
 // -------------------------------------------------------------------------- //
 
 struct region {
-    struct lock_t lock; // Global lock
+    // struct lock_t lock; // Global lock
     void *start;        // Start of the shared memory region
     struct link allocs; // Allocated shared memory regions
     size_t size;        // Size of the shared memory region (in bytes)
@@ -405,23 +406,21 @@ struct transaction {
     int id;
     bool is_ro;
     struct region *region;
-    bool abort;
 };
 
 struct link *get_segment(void *source, struct transaction *tx, struct region *region, void **data_start) {
     struct link *allocs = &(region->allocs);
 
     *data_start = region->start;
-    size_t size = region->size;
     struct link *link = &region->allocs;
 
     while (true) {
-        if (source >= *data_start && source < *data_start + size) {
+        if (source >= *data_start && source < *data_start + link->size) {
             return link;
         }
 
         link = link->next;
-        *data_start = link + region->delta_alloc;
+        *data_start = (void *)((uintptr_t)link + region->delta_alloc);
 
         if (link == allocs) {
             return NULL; // Not found
@@ -445,13 +444,15 @@ shared_t tm_create(size_t size, size_t align) {
         free(region);
         return invalid_shared;
     }
-    if (unlikely(!lock_init(&(region->lock)))) {
-        free(region->start);
-        free(region);
-        return invalid_shared;
-    }
+    // if (unlikely(!lock_init(&(region->lock)))) {
+    //     free(region->start);
+    //     free(region);
+    //     return invalid_shared;
+    // }
     memset(region->start, 0, size);
     link_reset(&(region->allocs));
+    region->allocs.size = size;
+
     region->size = size;
     region->align = align;
     region->align_alloc = align_alloc;
@@ -474,7 +475,7 @@ void tm_destroy(shared_t shared) {
     }
     free(region->start);
     free(region);
-    lock_cleanup(&(region->lock));
+    // lock_cleanup(&(region->lock));
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -509,9 +510,8 @@ size_t tm_align(shared_t shared) {
 tx_t tm_begin(shared_t shared, bool is_ro) {
     struct transaction *tr = malloc(sizeof(struct transaction));
     tr->is_ro = is_ro;
-    tr->region = (struct region *) shared;
-    tr->abort = false;
-
+    tr->region = (struct region *)shared;
+    
     return (tx_t) tr;
     // if (is_ro) {
     //     if (unlikely(!lock_acquire_shared(&(((struct region*) shared)->lock))))
@@ -526,13 +526,16 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
 
 //TODO: Implement
 void tm_rollback(shared_t shared, tx_t tx) {
+    // printf("Rollback start\n");
     struct region *region = (struct region *) shared;
     struct transaction *transaction = (struct transaction *) tx;
     struct link *allocs = &(region->allocs);
 
+    // TODO: DEBUG line - print
+    // __asm__ volatile ("int3;":::"memory");
+
     // Reverse each of our block
     void *start = region->start;
-    size_t size = region->size;
     struct link *link = &region->allocs;
 
     struct link *next_link = NULL;
@@ -544,7 +547,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
                 case WRITE_FLAG:
                 case WRITE_REMOVE_FLAG:
                     // Restore previous data
-                    memcpy(start, start + size, size);
+                    memcpy(start, start + link->size, link->size);
                 case REMOVED_FLAG:
                     link->status = READ_FLAG;
                 case READ_FLAG:
@@ -564,9 +567,11 @@ void tm_rollback(shared_t shared, tx_t tx) {
         link = next_link;
         start = link + region->delta_alloc;
     };
+    // printf("Rollback end\n");
 }
 
 void tm_commit(shared_t shared, tx_t tx) {
+    // printf("Commit start\n");
     struct region *region = (struct region *) shared;
     struct transaction *transaction = (struct transaction *) tx;
     struct link *allocs = &(region->allocs);
@@ -601,6 +606,7 @@ void tm_commit(shared_t shared, tx_t tx) {
 
         link = next_link;
     };
+    // printf("Commit end\n");
 }
 
 /** [thread-safe] End the given transaction.
@@ -609,13 +615,9 @@ void tm_commit(shared_t shared, tx_t tx) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
-    bool abort = ((struct transaction *) tx)->abort;
-    if (abort) {
-        tm_rollback(shared, tx);
-    } else {
-        tm_commit(shared, tx);
-    }
-    return abort;
+    // printf("TM end tx %x\n", tx);
+    tm_commit(shared, tx);
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -632,28 +634,27 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     void *data_start = NULL;
     struct link *link = get_segment(source, transaction, region, &data_start);
 
-    // if (unlikely(link==NULL)) {
-    //     transaction->abort = true;
-    //     return false;
-    // }
-
     // VERSION SIMPLE 1
     // Lock acquire
     void *lockOwner = link->lock_owner;
     if (lockOwner == NULL) {
-        if (!lock_try_acquire(&link->lock)) {
-            transaction->abort = true;
+        if (!lock_try_acquire(&(link->lock))) {
+            // printf("Read abort 1\n");
+            tm_rollback(shared, tx);
             return false;
         }
         link->lock_owner = transaction;
     } else if (lockOwner != transaction) {
-        transaction->abort = true;
+        // printf("Read abort 2\n");
+        tm_rollback(shared, tx);
         return false;
     }
 
     // Read the data
+    // printf("Read\n");
     memcpy(target, source, size);
 
+    // __asm__ volatile ("int3;":::"memory");
     return true;
 
     // VERSION 2 - INVISIBLE READS
@@ -679,20 +680,17 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
     struct region *region = (struct region *) shared;
     struct transaction *transaction = (struct transaction *) tx;
     void *data_start = NULL;
-    struct link *link = get_segment(source, transaction, region, &data_start);
+    struct link *link = get_segment(target, transaction, region, &data_start);
 
-    // if (unlikely(link==NULL)) {
-    //     transaction->abort = true;
-    //     return false;
-    // }
     // TODO: might be improved with compare&set in case of simple lock
 
     // VERSION SIMPLE 1
     // Lock acquire
     void *lockOwner = link->lock_owner;
     if (lockOwner == NULL) {
-        if (!lock_try_acquire(&link->lock)) {
-            transaction->abort = true;
+        if (!lock_try_acquire(&(link->lock))) {
+            // printf("Write abort 1\n");
+            tm_rollback(shared, tx);
             return false;
         }
         link->lock_owner = transaction;
@@ -701,14 +699,17 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
         link->status = WRITE_FLAG;
 
         // Save segment before write
-        memcpy(data_start + region->size, data_start, region->size);
+        memcpy(data_start + link->size, data_start, link->size);
 
     } else if (lockOwner != transaction) {
-        transaction->abort = true;
+        // printf("Write miss-acquire link %x by tx %x\n", link, tx);
+        // printf("Write abort 2\n");
+        tm_rollback(shared, tx);
         return false;
     }
 
     // Write data
+    // printf("Write acquire link %x by tx %x\n", link, tx);
     memcpy(target, source, size);
     return true;
 }
@@ -731,10 +732,11 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
 
     // TODO: See with link_init() method
     struct link *link = segment;
-    lock_init(&link->lock);
-    lock_acquire(&link->lock);
+    lock_init(&(link->lock));
+    lock_acquire(&(link->lock));
     link->lock_owner = transaction;
     link->status = ADDED_FLAG;
+    link->size = size;
 
     link_insert((struct link *) segment, &(((struct region *) shared)->allocs));
     segment = (void *) ((uintptr_t) segment + delta_alloc);
@@ -749,15 +751,15 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t shared, tx_t tx as(unused), void *segment) {
+bool tm_free(shared_t shared, tx_t tx, void *segment) {
     size_t delta_alloc = ((struct region *) shared)->delta_alloc;
     struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
     struct transaction *transaction = (struct transaction *) tx;
 
     void *lockOwner = link->lock_owner;
     if (lockOwner == NULL) {
-        if (!lock_try_acquire(&link->lock)) {
-            transaction->abort = true;
+        if (!lock_try_acquire(&(link->lock))) {
+            tm_rollback(shared, tx);
             return false;
         }
         link->lock_owner = transaction;
@@ -765,7 +767,7 @@ bool tm_free(shared_t shared, tx_t tx as(unused), void *segment) {
         // Save for eventual rollback
         link->status = REMOVED_FLAG;
     } else if (lockOwner != transaction) {
-        transaction->abort = true;
+        tm_rollback(shared, tx);
         return false;
     } else if (link->status == WRITE_FLAG) {
         link->status = WRITE_REMOVE_FLAG;
