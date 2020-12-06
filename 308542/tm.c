@@ -346,9 +346,9 @@ struct link {
     struct link *next;     // Next link in the chain
     struct lock_t lock;    // Lock
     size_t size;           // Size of the segment
-    void *lock_owner;      // Identifier of the lock owner
-    uint8_t status;        // Whether this blocks need to be added or removed in case of rollback and commit
-    uint32_t ts;           // Timestamp
+    void * volatile lock_owner;      // Identifier of the lock owner
+    uint8_t volatile status;        // Whether this blocks need to be added or removed in case of rollback and commit
+    uint32_t volatile ts;           // Timestamp
 
     // TODO: add additional write info data
 };
@@ -402,6 +402,7 @@ struct region {
     size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
 };
 
+// TODO: Could be improved by batching multiples read segment inside a single object
 struct read_segment {
     struct link* link;
     uint32_t ts;
@@ -578,6 +579,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
         link = next_link;
         start = link + region->delta_alloc;
     };
+    free(tx);
     // printf("Rollback end\n");
 }
 
@@ -592,6 +594,7 @@ void tm_rollback_reads(shared_t shared, tx_t tx) {
         free(read);
         read = next_read;
     }
+    free(tx);
 }
 
 bool tm_commit_reads(shared_t shared, tx_t tx) {
@@ -687,13 +690,13 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     struct link *link = get_segment(source, transaction, region, &data_start);
 
     if (transaction->is_ro) {
-        // Get current timestamp
-        uint32_t ts = link->ts;
-
         if (link->lock_owner != NULL) {
             tm_rollback_reads(shared, tx);
             return false;
         }
+
+        // Get current timestamp
+        uint32_t ts = link->ts;
         
         memcpy(target, source + (ts % 2) * link->size, size);
 
@@ -766,7 +769,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
 
     // Write data
     // printf("Write acquire link %x by tx %x\n", link, tx);
-    memcpy(target, source + ((link->ts + 1) % 2) * link->size, size);
+    memcpy(target + ((link->ts + 1) % 2) * link->size, source, size);
     return true;
 }
 
