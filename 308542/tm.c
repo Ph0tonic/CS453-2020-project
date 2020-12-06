@@ -344,25 +344,27 @@ static void lock_release_shared(struct lock_t* lock) {
 struct link {
     struct link *prev;     // Previous link in the chain
     struct link *next;     // Next link in the chain
-    struct lock_t lock;    // Lock
-    size_t size;           // Size of the segment
-    void *lock_owner;      // Identifier of the lock owner
-    uint8_t status;        // Whether this blocks need to be added or removed in case of rollback and commit
-//    uint32_t ts;           // Timestamp
-//    uint32_t old_ts;       // Timestamp save
 
-    // TODO: add additional write info data
+    size_t size;           // Size of the segment
+    // struct lock_t *lock;    // Lock
+    // void **lock_owner;      // Identifier of the lock owner
+    // uint8_t *status;        // Whether this blocks need to be added or removed in case of rollback and commit
+
+};
+
+struct segment_control {
+    struct lock_t lock;
+    void* lock_owner;
+    uint8_t status;
 };
 
 /** Link reset.
  * @param link Link to reset
 **/
-static void link_reset(struct link *link) {
+static void link_reset(struct link *link, size_t size) {
     link->prev = link;
     link->next = link;
-    lock_init(&link->lock);
-    link->lock_owner = NULL;
-    link->status = READ_FLAG;
+    link->size = size;
 }
 
 /** Link insertion before a "base" link.
@@ -440,7 +442,7 @@ shared_t tm_create(size_t size, size_t align) {
     }
     size_t align_alloc =
             align < sizeof(void *) ? sizeof(void *) : align; // Also satisfy alignment requirement of 'struct link'
-    if (unlikely(posix_memalign(&(region->start), align_alloc, 2 * size) != 0)) {
+    if (unlikely(posix_memalign(&(region->start), align_alloc, 2 * size + size/align_alloc * sizeof(struct segment_control)) != 0)) {
         free(region);
         return invalid_shared;
     }
@@ -449,8 +451,18 @@ shared_t tm_create(size_t size, size_t align) {
     //     free(region);
     //     return invalid_shared;
     // }
-    memset(region->start, 0, size);
-    link_reset(&(region->allocs));
+
+    struct segment_control* control = (region->start + size*2);
+    size_t segment_size = sizeof(struct segment_control);
+    for (uint i=0;i<size/align;++i) {
+        lock_init(&control->lock);
+        control->lock_owner = NULL;
+        control->status = READ_FLAG;
+        control += segment_size;
+    }
+
+    memset(region->start, 0, 2*size);
+    link_reset(&(region->allocs), size);
     region->allocs.size = size;
 
     region->size = size;
@@ -537,6 +549,8 @@ void tm_rollback(shared_t shared, tx_t tx) {
     // Reverse each of our block
     void *start = region->start;
     struct link *link = &region->allocs;
+
+    // TODO: Lock all the segment related to this link
 
     struct link *next_link = NULL;
     while (true) { // Free allocated segments
