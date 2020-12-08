@@ -32,7 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h> //TODO: REMOVE FOR DEBUG PURPOSES
-
+#include <semaphore.h>
 
 #if (defined(__i386__) || defined(__x86_64__)) && defined(USE_MM_PAUSE)
 #include <xmmintrin.h>
@@ -392,6 +392,16 @@ static const tx_t read_write_tx = UINTPTR_MAX - 11;
 
 // -------------------------------------------------------------------------- //
 
+#define BATCHER_TRANSACTION_NUMBER 100
+struct batcher {
+    // sem_t semaphore;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    uint32_t volatile counter;
+    uint32_t volatile epoch;
+    uint32_t volatile nbEntered;
+};
+
 struct region {
     // struct lock_t lock; // Global lock
     void *start;        // Start of the shared memory region
@@ -400,13 +410,97 @@ struct region {
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
     size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
+
+    struct batcher batcher;
 };
 
 struct transaction {
     int id;
     bool is_ro;
     struct region *region;
+    uint32_t epoch;
 };
+
+// Return wether it's a success
+bool init_batcher(struct batcher *batcher) {
+    batcher->epoch = 1;
+    batcher->counter = BATCHER_TRANSACTION_NUMBER;
+    batcher->nbEntered = 0;
+    return pthread_mutex_init(&(batcher->mutex), NULL) == 0;
+}
+
+// Return the epoch
+uint32_t enter(struct batcher *batcher) {
+    // printf("Enter\n");
+    pthread_mutex_lock(&(batcher->mutex));
+    while (batcher->counter == 0) {
+        pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
+    }
+    batcher->counter--;
+    batcher->nbEntered++;
+    uint32_t epoch = batcher->epoch;
+    pthread_mutex_unlock(&(batcher->mutex));
+    return epoch;
+}
+
+void leave(struct batcher *batcher, struct transaction* tr) {
+    pthread_mutex_lock(&(batcher->mutex));
+    batcher->nbEntered--;
+    if (batcher->nbEntered == 0){
+        batch_commit(batcher->epoch, tr->region);
+        batcher->epoch++;
+        batcher->counter = BATCHER_TRANSACTION_NUMBER;
+        pthread_cond_broadcast(&(batcher->cond));
+    } else {
+        pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
+    }
+    pthread_mutex_unlock(&(batcher->mutex));
+}
+
+void batch_commit(uint32_t epoch, struct region *region) {
+    struct link *allocs = &(region->allocs);
+
+    // Unlock each of our block
+    struct link *link = &region->allocs;
+    struct link *next_link = NULL;
+    void* start = region->start;
+    // printf("--\n");
+    while (true) {
+        next_link = link->next;
+
+        if (link->lock_owner != NULL) {
+            // printf("Status %d\n", link->status);
+            switch (link->status) {
+                case WRITE_REMOVE_FLAG:
+                case REMOVED_FLAG:
+                    // Free this block
+                    link_remove(link);
+                    free(link);
+                    break;
+                case ADDED_FLAG:
+                    // printf("Write %d\n", link->size);
+                    // printf("Write link %x\n", link);
+                    // printf("Write data %x\n", start);
+                case WRITE_FLAG:
+                    // Commit changes
+                    memcpy(start, ((char*)start) + link->size, link->size);
+                    // printf("after %x\n", start);
+                    link->status = READ_FLAG;
+                case READ_FLAG:
+                    link->lock_owner = NULL;
+                    lock_release(&link->lock);
+                    break;
+            }
+            // printf("end %d\n", link->status);
+        }
+        if (next_link == allocs) {
+            break;
+        }
+
+        link = next_link;
+        start = (void*)(((uintptr_t)link) + region->delta_alloc);
+    };
+}
 
 struct link *get_segment(void *source, struct transaction *tx, struct region *region, void **data_start) {
     struct link *allocs = &(region->allocs);
@@ -444,11 +538,11 @@ shared_t tm_create(size_t size, size_t align) {
         free(region);
         return invalid_shared;
     }
-    // if (unlikely(!lock_init(&(region->lock)))) {
-    //     free(region->start);
-    //     free(region);
-    //     return invalid_shared;
-    // }
+
+    if (unlikely(!init_batcher(&(region->batcher)))) {
+        free(region);
+        return invalid_shared;
+    }
     memset(region->start, 0, size);
     link_reset(&(region->allocs));
     region->allocs.size = size;
@@ -511,6 +605,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     struct transaction *tr = malloc(sizeof(struct transaction));
     tr->is_ro = is_ro;
     tr->region = (struct region *)shared;
+    tr->epoch = enter(&(tr->region->batcher));
     
     return (tx_t) tr;
     // if (is_ro) {
@@ -535,10 +630,10 @@ void tm_rollback(shared_t shared, tx_t tx) {
     // __asm__ volatile ("int3;":::"memory");
 
     // Reverse each of our block
-    void *start = region->start;
     struct link *link = &region->allocs;
-
     struct link *next_link = NULL;
+    void *start = region->start;
+
     while (true) { // Free allocated segments
         next_link = link->next;
 
@@ -547,7 +642,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
                 case WRITE_FLAG:
                 case WRITE_REMOVE_FLAG:
                     // Restore previous data
-                    memcpy(start, start + link->size, link->size);
+                    memcpy(((char*)start) + link->size, start, link->size);
                 case REMOVED_FLAG:
                     link->status = READ_FLAG;
                 case READ_FLAG:
@@ -561,52 +656,16 @@ void tm_rollback(shared_t shared, tx_t tx) {
             }
         }
         if (next_link == allocs) {
+            // printf("Abort transaction\n");
             break;
         }
 
         link = next_link;
-        start = link + region->delta_alloc;
+        start = (void*)(((uintptr_t)link) + region->delta_alloc);
     };
+    leave(&(region->batcher), transaction);
+
     // printf("Rollback end\n");
-}
-
-void tm_commit(shared_t shared, tx_t tx) {
-    // printf("Commit start\n");
-    struct region *region = (struct region *) shared;
-    struct transaction *transaction = (struct transaction *) tx;
-    struct link *allocs = &(region->allocs);
-
-    // Unlock each of our block
-    struct link *link = &region->allocs;
-    struct link *next_link = NULL;
-
-    while (true) {
-        next_link = link->next;
-
-        if (link->lock_owner == transaction) {
-            switch (link->status) {
-                case WRITE_REMOVE_FLAG:
-                case REMOVED_FLAG:
-                    // Free this block
-                    link_remove(link);
-                    free(link);
-                    break;
-                case ADDED_FLAG:
-                case WRITE_FLAG:
-                    link->status = READ_FLAG;
-                case READ_FLAG:
-                    link->lock_owner = NULL;
-                    lock_release(&link->lock);
-                    break;
-            }
-        }
-        if (next_link == allocs) {
-            break;
-        }
-
-        link = next_link;
-    };
-    // printf("Commit end\n");
 }
 
 /** [thread-safe] End the given transaction.
@@ -615,8 +674,10 @@ void tm_commit(shared_t shared, tx_t tx) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
+    leave(&((struct region*) shared)->batcher, tx);
+
     // printf("TM end tx %x\n", tx);
-    tm_commit(shared, tx);
+    // tm_commit(shared, tx);
     return true;
 }
 
@@ -634,38 +695,32 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     void *data_start = NULL;
     struct link *link = get_segment(source, transaction, region, &data_start);
 
-    // VERSION SIMPLE 1
-    // Lock acquire
-    void *lockOwner = link->lock_owner;
-    if (lockOwner == NULL) {
-        if (!lock_try_acquire(&(link->lock))) {
-            // printf("Read abort 1\n");
+    // VERSION 2
+    if (transaction->is_ro) {
+        // Read the data
+        memcpy(target, source, size);
+
+    } else {
+        // Lock acquire
+        void *lockOwner = link->lock_owner;
+        if (lockOwner == NULL) {
+            if (!lock_try_acquire(&(link->lock))) {
+                // printf("Read abort 1\n");
+                tm_rollback(shared, tx);
+                return false;
+            }
+            link->lock_owner = transaction;
+        } else if (lockOwner != transaction) {
+            // printf("Read abort 2\n");
             tm_rollback(shared, tx);
             return false;
         }
-        link->lock_owner = transaction;
-    } else if (lockOwner != transaction) {
-        // printf("Read abort 2\n");
-        tm_rollback(shared, tx);
-        return false;
+        
+        // Read the data
+        memcpy(target, source + link->size, size);
     }
 
-    // Read the data
-    // printf("Read\n");
-    memcpy(target, source, size);
-
-    // __asm__ volatile ("int3;":::"memory");
     return true;
-
-    // VERSION 2 - INVISIBLE READS
-    // // TODO: Read TM
-    // int ts = link->ts;
-    // // TODO: Read data
-    // memcpy(target, source, size);
-    // // TODO: Read TM
-    // return ts == link->ts;
-
-    // return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -684,7 +739,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
 
     // TODO: might be improved with compare&set in case of simple lock
 
-    // VERSION SIMPLE 1
+    // VERSION 2
     // Lock acquire
     void *lockOwner = link->lock_owner;
     if (lockOwner == NULL) {
@@ -695,12 +750,6 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
         }
         link->lock_owner = transaction;
 
-        // Update status
-        link->status = WRITE_FLAG;
-
-        // Save segment before write
-        memcpy(data_start + link->size, data_start, link->size);
-
     } else if (lockOwner != transaction) {
         // printf("Write miss-acquire link %x by tx %x\n", link, tx);
         // printf("Write abort 2\n");
@@ -708,9 +757,11 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
         return false;
     }
 
+    link->status = WRITE_FLAG;
+
     // Write data
     // printf("Write acquire link %x by tx %x\n", link, tx);
-    memcpy(target, source, size);
+    memcpy(target + link->size, source, size);
     return true;
 }
 
@@ -742,6 +793,9 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     segment = (void *) ((uintptr_t) segment + delta_alloc);
     memset(segment, 0, size);
     *target = segment;
+    
+    // printf("Link %x\n", link);
+    // printf("Data %x\n", segment);
     return success_alloc;
 }
 
