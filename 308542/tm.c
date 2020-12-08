@@ -695,17 +695,19 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
         }
         link->lock_owner = transaction;
 
-        // Update status
-        link->status = WRITE_FLAG;
-
-        // Save segment before write
-        memcpy(data_start + link->size, data_start, link->size);
-
     } else if (lockOwner != transaction) {
         // printf("Write miss-acquire link %x by tx %x\n", link, tx);
         // printf("Write abort 2\n");
         tm_rollback(shared, tx);
         return false;
+    }
+
+    if (link->status == READ_FLAG) {
+        // Update status
+        link->status = WRITE_FLAG;
+
+        // Save segment before write
+        memcpy(data_start + link->size, data_start, link->size);
     }
 
     // Write data
