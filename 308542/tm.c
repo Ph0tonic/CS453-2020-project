@@ -547,7 +547,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
                 case WRITE_FLAG:
                 case WRITE_REMOVE_FLAG:
                     // Restore previous data
-                    memcpy(start, start + link->size, link->size);
+                    memcpy(start, ((char*)start) + link->size, link->size);
                 case REMOVED_FLAG:
                     link->status = READ_FLAG;
                 case READ_FLAG:
@@ -707,7 +707,7 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
         link->status = WRITE_FLAG;
 
         // Save segment before write
-        memcpy(data_start + link->size, data_start, link->size);
+        memcpy(((char*)data_start) + link->size, data_start, link->size);
     }
 
     // Write data
