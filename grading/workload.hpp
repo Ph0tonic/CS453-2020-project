@@ -327,7 +327,7 @@ public:
             if (unlikely(!correct)) {
                 barrier.sync();
                 barrier.sync();
-                return "Violated consistency";
+                return "Violated consistency 1st";
             }
         }
         barrier.sync();
@@ -356,7 +356,7 @@ public:
                 return counter == 0;
             });
             if (unlikely(!correct))
-                return "Violated consistency";
+                return "Violated consistency read";
         }
         return nullptr;
     }
