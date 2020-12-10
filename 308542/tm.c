@@ -342,11 +342,10 @@ static void lock_release_shared(struct lock_t* lock) {
 #define ADDED_FLAG 4
 
 struct link {
+    void * volatile owner; // Identifier of the lock owner
     struct link *prev;     // Previous link in the chain
     struct link *next;     // Next link in the chain
-    struct lock_t lock;    // Lock
     size_t size;           // Size of the segment
-    void * volatile lock_owner;      // Identifier of the lock owner
     uint8_t volatile status;        // Whether this blocks need to be added or removed in case of rollback and commit
     uint32_t volatile ts;           // Timestamp
 
@@ -359,8 +358,7 @@ struct link {
 static void link_reset(struct link *link) {
     link->prev = link;
     link->next = link;
-    lock_init(&link->lock);
-    link->lock_owner = NULL;
+    link->owner = NULL;
     link->status = READ_FLAG;
     link->ts = 0;
 }
@@ -553,7 +551,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
     while (true) { // Free allocated segments
         next_link = link->next;
 
-        if (link->lock_owner == transaction) {
+        if (link->owner == transaction) {
             switch (link->status) {
                 case WRITE_FLAG:
                 case WRITE_REMOVE_FLAG:
@@ -563,8 +561,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
                 case REMOVED_FLAG:
                     link->status = READ_FLAG;
                 case READ_FLAG:
-                    link->lock_owner = NULL;
-                    lock_release(&link->lock);
+                    link->owner = NULL;
                     break;
                 case ADDED_FLAG:
                     link_remove(link);
@@ -605,7 +602,7 @@ bool tm_commit_reads(shared_t shared, tx_t tx) {
     struct read_segment* next_read = NULL;
     
     while (read != NULL) {
-        if (read->link->lock_owner != NULL || read->ts != read->link->ts){
+        if (read->link->owner != NULL || read->ts != read->link->ts){
             res = false;
         }
         next_read = read->next;
@@ -630,7 +627,7 @@ void tm_commit(shared_t shared, tx_t tx) {
     while (true) {
         next_link = link->next;
 
-        if (link->lock_owner == transaction) {
+        if (link->owner == transaction) {
             switch (link->status) {
                 case WRITE_REMOVE_FLAG:
                 case REMOVED_FLAG:
@@ -645,8 +642,7 @@ void tm_commit(shared_t shared, tx_t tx) {
                 case ADDED_FLAG:
                     link->status = READ_FLAG;
                 case READ_FLAG:
-                    link->lock_owner = NULL;
-                    lock_release(&link->lock);
+                    link->owner = NULL;
                     break;
             }
         }
@@ -690,7 +686,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     struct link *link = get_segment(source, transaction, region, &data_start);
 
     if (transaction->is_ro) {
-        if (link->lock_owner != NULL) {
+        if (link->owner != NULL) {
             tm_rollback_reads(shared, tx);
             return false;
         }
@@ -710,16 +706,9 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         return true;
     } else {
         // Lock acquire
-        void *lockOwner = link->lock_owner;
-        if (lockOwner == NULL) {
-            if (!lock_try_acquire(&(link->lock))) {
-                // printf("Read abort 1\n");
-                tm_rollback(shared, tx);
-                return false;
-            }
-            link->lock_owner = transaction;
-        } else if (lockOwner != transaction) {
-            // printf("Read abort 2\n");
+        struct transaction *previous = NULL;
+        if (link->owner != tx && !atomic_compare_exchange_strong((struct transaction **)&link->owner, &previous, transaction)) {
+            // printf("Read abort 1\n");
             tm_rollback(shared, tx);
             return false;
         }
@@ -745,22 +734,10 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
     void *data_start = NULL;
     struct link *link = get_segment(target, transaction, region, &data_start);
 
-    // TODO: might be improved with compare&set in case of simple lock
-
-    // VERSION SIMPLE 1
     // Lock acquire
-    void *lockOwner = link->lock_owner;
-    if (lockOwner == NULL) {
-        if (!lock_try_acquire(&(link->lock))) {
-            // printf("Write abort 1\n");
-            tm_rollback(shared, tx);
-            return false;
-        }
-        link->lock_owner = transaction;
-
-    } else if (lockOwner != transaction) {
-        // printf("Write miss-acquire link %x by tx %x\n", link, tx);
-        // printf("Write abort 2\n");
+    struct transaction *previous = NULL;
+    if (link->owner != tx && !atomic_compare_exchange_strong((struct transaction **)&link->owner, &previous, transaction)) {
+        // printf("Read abort 1\n");
         tm_rollback(shared, tx);
         return false;
     }
@@ -790,11 +767,8 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     if (unlikely(posix_memalign(&segment, align_alloc, delta_alloc + 2 * size) != 0)) // Allocation failed
         return nomem_alloc;
 
-    // TODO: See with link_init() method
     struct link *link = segment;
-    lock_init(&(link->lock));
-    lock_acquire(&(link->lock));
-    link->lock_owner = transaction;
+    link->owner = transaction;
     link->status = ADDED_FLAG;
     link->size = size;
     link->ts = 0;
@@ -817,31 +791,19 @@ bool tm_free(shared_t shared, tx_t tx, void *segment) {
     struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
     struct transaction *transaction = (struct transaction *) tx;
 
-    void *lockOwner = link->lock_owner;
-    if (lockOwner == NULL) {
-        if (!lock_try_acquire(&(link->lock))) {
-            tm_rollback(shared, tx);
-            return false;
-        }
-        link->lock_owner = transaction;
-
-        // Save for eventual rollback
-        link->status = REMOVED_FLAG;
-    } else if (lockOwner != transaction) {
+    // Lock acquire
+    struct transaction *previous = NULL;
+    if (link->owner != tx && !atomic_compare_exchange_strong((struct transaction **)&link->owner, &previous, transaction)) {
+        // printf("Read abort 1\n");
         tm_rollback(shared, tx);
         return false;
-    } else if (link->status == WRITE_FLAG) {
+    }
+
+    if (link->status == WRITE_FLAG) {
         link->status = WRITE_REMOVE_FLAG;
     } else {
         link->status = REMOVED_FLAG;
     }
 
     return true;
-
-    // Original code
-//    size_t delta_alloc = ((struct region *) shared)->delta_alloc;
-//    segment = (void *) ((uintptr_t) segment - delta_alloc);
-//    link_remove((struct link *) segment);
-//    free(segment);
-//    return true;
 }
