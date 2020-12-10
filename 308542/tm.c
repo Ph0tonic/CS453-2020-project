@@ -114,7 +114,7 @@ struct link {
 
     size_t size;           // Size of the segment
     int status;            // Whether this blocks need to be added or removed in case of rollback and commit
-    void* status_owner;   // Identifier of the lock owner
+    void *status_owner;   // Identifier of the lock owner
 };
 
 /** Link reset.
@@ -389,7 +389,8 @@ void tm_rollback(shared_t shared, tx_t tx) {
             }
 
             if (!added) {
-                struct transaction *volatile *controles = (struct transaction* volatile *)((char*) start + 2 * link->size);
+                struct transaction *volatile *controles = (struct transaction *volatile *) ((char *) start +
+                                                                                            2 * link->size);
                 size_t align = region->align;
                 size_t size = region->size;
                 size_t nb = link->size / region->align;
@@ -420,8 +421,8 @@ void tm_rollback(shared_t shared, tx_t tx) {
  * @return Whether the whole transaction committed
 **/
 bool tm_end(shared_t shared, tx_t tx) {
-    leave(&((struct region *) shared)->batcher, (struct transaction *)tx);
-    free((struct transaction *)tx);
+    leave(&((struct region *) shared)->batcher, (struct transaction *) tx);
+    free((struct transaction *) tx);
     return true;
 }
 
@@ -431,13 +432,13 @@ bool lock_words(struct region *region, struct transaction *tx, struct link *link
     size_t nb = size / region->align;
 
     // Not technicaly correct TODO: we should add some alignement between the data and the control structure
-    struct transaction *volatile *controls = (struct transaction *volatile *)(start + link->size * 2);
+    struct transaction *volatile *controls = (struct transaction *volatile *) (start + link->size * 2);
 
     for (size_t i = index; i < index + nb; ++i) {
         struct transaction *previous = NULL;
         if (controls[i] != tx && !atomic_compare_exchange_strong(controls + i, &previous, tx)) {
             if (i - index > 1) {
-                memset((void *)(controls + i), 0, i - index - 1);
+                memset((void *) (controls + i), 0, i - index - 1);
             }
             return false;
         }
@@ -474,7 +475,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         struct transaction *volatile *controls = (struct transaction *volatile *) (start + link->size * 2);
 
         for (size_t i = index; i < index + nb; ++i) {
-            if (controls[i] == (struct transaction *)tx) {
+            if (controls[i] == (struct transaction *) tx) {
                 memcpy(target, (char *) source + i * align + link->size, align);
             } else {
                 memcpy(target, (char *) source + i * align, align);
@@ -489,7 +490,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         // Read the data
         memcpy(target, (char *) source + link->size, size);
     }
-    
+
     return true;
 }
 
@@ -511,8 +512,8 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
         tm_rollback(shared, tx);
         return false;
     }
- 
-    memcpy((char *)target + link->size, source, size);
+
+    memcpy((char *) target + link->size, source, size);
     return true;
 }
 
@@ -540,7 +541,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     // TODO: See with link_init() method
     struct link *link = segment;
     link->size = size;
-    link->status_owner = (void *)transaction;
+    link->status_owner = (void *) transaction;
     link->status = ADDED_FLAG;
 
     link_insert((struct link *) segment, &(((struct region *) shared)->allocs));
@@ -564,12 +565,12 @@ bool tm_free(shared_t shared, tx_t tx, void *segment) {
     struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
 
     void *owner = link->status_owner;
-    if (unlikely(owner != NULL && owner != (void *)tx)) {
+    if (unlikely(owner != NULL && owner != (void *) tx)) {
         printf("Unlikely lock free segment\n");
         return false;
     }
 
-    link->status_owner = (void *)tx;
+    link->status_owner = (void *) tx;
 
     if (link->status == ADDED_FLAG) {
         link->status = ADDED_REMOVED_FLAG;
