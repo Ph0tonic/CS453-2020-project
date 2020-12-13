@@ -97,235 +97,6 @@ static inline void pause() {
 
 // -------------------------------------------------------------------------- //
 
-#if defined(USE_PTHREAD_LOCK)
-
-struct lock_t {
-    pthread_mutex_t mutex;
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t* lock) {
-    return pthread_mutex_init(&(lock->mutex), NULL) == 0;
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t* lock) {
-    pthread_mutex_destroy(&(lock->mutex));
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t* lock) {
-    return pthread_mutex_lock(&(lock->mutex)) == 0;
-}
-
-/** Try to acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_try_acquire(struct lock_t* lock) {
-    return pthread_mutex_trylock(&(lock->mutex)) == 0;
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t* lock) {
-    pthread_mutex_unlock(&(lock->mutex));
-}
-
-static bool lock_acquire_shared(struct lock_t* lock) {
-    return lock_acquire(lock);
-}
-
-static bool lock_try_acquire_shared(struct lock_t* lock) {
-    return lock_try_acquire(lock);
-}
-
-static void lock_release_shared(struct lock_t* lock) {
-    lock_release(lock);
-}
-
-#elif defined(USE_TICKET_LOCK)
-
-struct lock_t {
-    atomic_ulong pass; // Ticket that acquires the lock
-    atomic_ulong take; // Ticket the next thread takes
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t* lock) {
-    atomic_init(&(lock->pass), 0ul);
-    atomic_init(&(lock->take), 0ul);
-    return true;
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t* lock as(unused)) {
-    return;
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t* lock) {
-    unsigned long ticket = atomic_fetch_add_explicit(&(lock->take), 1ul, memory_order_relaxed);
-    while (atomic_load_explicit(&(lock->pass), memory_order_relaxed) != ticket)
-        pause();
-    atomic_thread_fence(memory_order_acquire);
-    return true;
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t* lock) {
-    atomic_fetch_add_explicit(&(lock->pass), 1, memory_order_release);
-}
-
-static bool lock_acquire_shared(struct lock_t* lock) {
-    return lock_acquire(lock);
-}
-
-static void lock_release_shared(struct lock_t* lock) {
-    lock_release(lock);
-}
-
-#elif defined(USE_RW_LOCK)
-
-struct lock_t {
-    pthread_rwlock_t rwlock;
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t *lock) {
-    return (0 == pthread_rwlock_init(&lock->rwlock, NULL));
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t *lock as(unused)) {
-    pthread_rwlock_destroy(&lock->rwlock);
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t *lock) {
-    return (0 == pthread_rwlock_wrlock(&lock->rwlock));
-}
-
-/** Try to acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_try_acquire(struct lock_t *lock) {
-    return (0 == pthread_rwlock_trywrlock(&lock->rwlock));
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t *lock) {
-    pthread_rwlock_unlock(&lock->rwlock);
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire_shared(struct lock_t *lock) {
-    return (0 == pthread_rwlock_rdlock(&lock->rwlock));
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_try_acquire_shared(struct lock_t *lock) {
-    return (0 == pthread_rwlock_tryrdlock(&lock->rwlock));
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release_shared(struct lock_t *lock) {
-    pthread_rwlock_unlock(&lock->rwlock);
-}
-
-#else // Test-and-test-and-set
-
-struct lock_t {
-    atomic_bool locked; // Whether the lock is taken
-};
-
-/** Initialize the given lock.
- * @param lock Lock to initialize
- * @return Whether the operation is a success
-**/
-static bool lock_init(struct lock_t* lock) {
-    atomic_init(&(lock->locked), false);
-    return true;
-}
-
-/** Clean the given lock up.
- * @param lock Lock to clean up
-**/
-static void lock_cleanup(struct lock_t* lock as(unused)) {
-    return;
-}
-
-/** Wait and acquire the given lock.
- * @param lock Lock to acquire
- * @return Whether the operation is a success
-**/
-static bool lock_acquire(struct lock_t* lock) {
-    bool expected = false;
-    while (unlikely(!atomic_compare_exchange_weak_explicit(&(lock->locked), &expected, true, memory_order_acquire, memory_order_relaxed))) {
-        expected = false;
-        while (unlikely(atomic_load_explicit(&(lock->locked), memory_order_relaxed)))
-            pause();
-    }
-    return true;
-}
-
-/** Release the given lock.
- * @param lock Lock to release
-**/
-static void lock_release(struct lock_t* lock) {
-    atomic_store_explicit(&(lock->locked), false, memory_order_release);
-}
-
-static bool lock_acquire_shared(struct lock_t* lock) {
-    return lock_acquire(lock);
-}
-
-static void lock_release_shared(struct lock_t* lock) {
-    lock_release(lock);
-}
-
-#endif
-
-// -------------------------------------------------------------------------- //
-
 /** Compute a pointer to the parent structure.
  * @param ptr    Member pointer
  * @param type   Parent type
@@ -342,11 +113,10 @@ static void lock_release_shared(struct lock_t* lock) {
 #define ADDED_FLAG 4
 
 struct link {
+    volatile tx_t owner;           // Identifier of the lock owner
     struct link *prev;     // Previous link in the chain
     struct link *next;     // Next link in the chain
-    struct lock_t lock;    // Lock
     size_t size;           // Size of the segment
-    void *lock_owner;      // Identifier of the lock owner
     uint8_t status;        // Whether this blocks need to be added or removed in case of rollback and commit
 //    uint32_t ts;           // Timestamp
 //    uint32_t old_ts;       // Timestamp save
@@ -360,8 +130,7 @@ struct link {
 static void link_reset(struct link *link) {
     link->prev = link;
     link->next = link;
-    lock_init(&link->lock);
-    link->lock_owner = NULL;
+    link->owner = 0;
     link->status = READ_FLAG;
 }
 
@@ -387,10 +156,9 @@ static void link_remove(struct link *link) {
     next->prev = prev;
 }
 
-static const tx_t read_only_tx = UINTPTR_MAX - 10;
-static const tx_t read_write_tx = UINTPTR_MAX - 11;
-
 // -------------------------------------------------------------------------- //
+
+static const tx_t read_only_tx  = UINTPTR_MAX - 1;
 
 struct region {
     // struct lock_t lock; // Global lock
@@ -400,15 +168,17 @@ struct region {
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
     size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
+
+    atomic_int counter; // TX identifier counter
 };
 
-struct transaction {
-    int id;
-    bool is_ro;
-    struct region *region;
-};
+// struct transaction {
+//     int id;
+//     bool is_ro;
+//     struct region *region;
+// };
 
-struct link *get_segment(void *source, struct transaction *tx, struct region *region, void **data_start) {
+struct link *get_segment(const void *source, struct region *region, void **data_start) {
     struct link *allocs = &(region->allocs);
 
     *data_start = region->start;
@@ -452,6 +222,7 @@ shared_t tm_create(size_t size, size_t align) {
     memset(region->start, 0, size);
     link_reset(&(region->allocs));
     region->allocs.size = size;
+    region->counter = 1;
 
     region->size = size;
     region->align = align;
@@ -508,27 +279,16 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
-    struct transaction *tr = malloc(sizeof(struct transaction));
-    tr->is_ro = is_ro;
-    tr->region = (struct region *)shared;
+    struct region *region = (struct region *) shared;
+
+    int id = atomic_fetch_add_explicit(&(region->counter), 1, memory_order_relaxed);
     
-    return (tx_t) tr;
-    // if (is_ro) {
-    //     if (unlikely(!lock_acquire_shared(&(((struct region*) shared)->lock))))
-    //         return invalid_tx;
-    //     return read_only_tx;
-    // } else {
-    //     if (unlikely(!lock_acquire(&(((struct region*) shared)->lock))))
-    //         return invalid_tx;
-    //     return read_write_tx;
-    // }
+    return (tx_t) id;
 }
 
 //TODO: Implement
-void tm_rollback(shared_t shared, tx_t tx) {
+void tm_rollback(struct region *region, tx_t transaction) {
     // printf("Rollback start\n");
-    struct region *region = (struct region *) shared;
-    struct transaction *transaction = (struct transaction *) tx;
     struct link *allocs = &(region->allocs);
 
     // TODO: DEBUG line - print
@@ -542,17 +302,19 @@ void tm_rollback(shared_t shared, tx_t tx) {
     while (true) { // Free allocated segments
         next_link = link->next;
 
-        if (link->lock_owner == transaction) {
+        if (atomic_load(&link->owner) == transaction) {
             switch (link->status) {
                 case WRITE_FLAG:
+                    __attribute__ ((fallthrough));
                 case WRITE_REMOVE_FLAG:
                     // Restore previous data
                     memcpy(start, ((char*)start) + link->size, link->size);
+                    __attribute__ ((fallthrough));
                 case REMOVED_FLAG:
                     link->status = READ_FLAG;
+                    __attribute__ ((fallthrough));
                 case READ_FLAG:
-                    link->lock_owner = NULL;
-                    lock_release(&link->lock);
+                    link->owner = 0;
                     break;
                 case ADDED_FLAG:
                     link_remove(link);
@@ -573,7 +335,6 @@ void tm_rollback(shared_t shared, tx_t tx) {
 void tm_commit(shared_t shared, tx_t tx) {
     // printf("Commit start\n");
     struct region *region = (struct region *) shared;
-    struct transaction *transaction = (struct transaction *) tx;
     struct link *allocs = &(region->allocs);
 
     // Unlock each of our block
@@ -583,20 +344,22 @@ void tm_commit(shared_t shared, tx_t tx) {
     while (true) {
         next_link = link->next;
 
-        if (link->lock_owner == transaction) {
+        if (atomic_load(&link->owner) == tx) {
             switch (link->status) {
                 case WRITE_REMOVE_FLAG:
+                    __attribute__ ((fallthrough));
                 case REMOVED_FLAG:
                     // Free this block
                     link_remove(link);
                     free(link);
                     break;
                 case ADDED_FLAG:
+                    __attribute__ ((fallthrough));
                 case WRITE_FLAG:
                     link->status = READ_FLAG;
+                    __attribute__ ((fallthrough));
                 case READ_FLAG:
-                    link->lock_owner = NULL;
-                    lock_release(&link->lock);
+                    link->owner = 0;
                     break;
             }
         }
@@ -630,42 +393,21 @@ bool tm_end(shared_t shared, tx_t tx) {
 **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     struct region *region = (struct region *) shared;
-    struct transaction *transaction = (struct transaction *) tx;
     void *data_start = NULL;
-    struct link *link = get_segment(source, transaction, region, &data_start);
+    struct link *link = get_segment(source, region, &data_start);
 
-    // VERSION SIMPLE 1
     // Lock acquire
-    void *lockOwner = link->lock_owner;
-    if (lockOwner == NULL) {
-        if (!lock_try_acquire(&(link->lock))) {
-            // printf("Read abort 1\n");
-            tm_rollback(shared, tx);
-            return false;
-        }
-        link->lock_owner = transaction;
-    } else if (lockOwner != transaction) {
-        // printf("Read abort 2\n");
-        tm_rollback(shared, tx);
+    tx_t previous = 0;
+    if (atomic_load(&link->owner) != tx && !atomic_compare_exchange_strong(&link->owner, &previous, tx)) {
+        tm_rollback(region, tx);
         return false;
     }
 
     // Read the data
-    // printf("Read\n");
     memcpy(target, source, size);
 
     // __asm__ volatile ("int3;":::"memory");
     return true;
-
-    // VERSION 2 - INVISIBLE READS
-    // // TODO: Read TM
-    // int ts = link->ts;
-    // // TODO: Read data
-    // memcpy(target, source, size);
-    // // TODO: Read TM
-    // return ts == link->ts;
-
-    // return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -676,29 +418,15 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source, size_t size, void *target) {
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     struct region *region = (struct region *) shared;
-    struct transaction *transaction = (struct transaction *) tx;
     void *data_start = NULL;
-    struct link *link = get_segment(target, transaction, region, &data_start);
+    struct link *link = get_segment(target, region, &data_start);
 
-    // TODO: might be improved with compare&set in case of simple lock
-
-    // VERSION SIMPLE 1
-    // Lock acquire
-    void *lockOwner = link->lock_owner;
-    if (lockOwner == NULL) {
-        if (!lock_try_acquire(&(link->lock))) {
-            // printf("Write abort 1\n");
-            tm_rollback(shared, tx);
-            return false;
-        }
-        link->lock_owner = transaction;
-
-    } else if (lockOwner != transaction) {
-        // printf("Write miss-acquire link %x by tx %x\n", link, tx);
-        // printf("Write abort 2\n");
-        tm_rollback(shared, tx);
+    // Lock acquire    
+    tx_t previous = 0;
+    if (atomic_load(&link->owner) != tx && !atomic_compare_exchange_strong(&link->owner, &previous, tx)) {
+        tm_rollback(region, tx);
         return false;
     }
 
@@ -711,7 +439,6 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
     }
 
     // Write data
-    // printf("Write acquire link %x by tx %x\n", link, tx);
     memcpy(target, source, size);
     return true;
 }
@@ -724,8 +451,6 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
-    struct transaction *transaction = (struct transaction *) tx;
-
     size_t align_alloc = ((struct region *) shared)->align_alloc;
     size_t delta_alloc = ((struct region *) shared)->delta_alloc;
     void *segment;
@@ -734,9 +459,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
 
     // TODO: See with link_init() method
     struct link *link = segment;
-    lock_init(&(link->lock));
-    lock_acquire(&(link->lock));
-    link->lock_owner = transaction;
+    link->owner = tx;
     link->status = ADDED_FLAG;
     link->size = size;
 
@@ -756,34 +479,18 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
 bool tm_free(shared_t shared, tx_t tx, void *segment) {
     size_t delta_alloc = ((struct region *) shared)->delta_alloc;
     struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
-    struct transaction *transaction = (struct transaction *) tx;
-
-    void *lockOwner = link->lock_owner;
-    if (lockOwner == NULL) {
-        if (!lock_try_acquire(&(link->lock))) {
-            tm_rollback(shared, tx);
-            return false;
-        }
-        link->lock_owner = transaction;
-
-        // Save for eventual rollback
-        link->status = REMOVED_FLAG;
-    } else if (lockOwner != transaction) {
-        tm_rollback(shared, tx);
+    
+    tx_t previous = 0;
+    if (atomic_load(&link->owner) != tx && !atomic_compare_exchange_strong(&link->owner, &previous, tx)) {
+        tm_rollback((struct region *)shared, tx);
         return false;
-    } else if (link->status == WRITE_FLAG) {
+    }
+    
+    if (link->status == WRITE_FLAG) {
         link->status = WRITE_REMOVE_FLAG;
     } else {
         link->status = REMOVED_FLAG;
     }
 
     return true;
-
-    // Original code
-//    size_t delta_alloc = ((struct region *) shared)->delta_alloc;
-//    segment = (void *) ((uintptr_t) segment - delta_alloc);
-//    link_remove((struct link *) segment);
-//    free(segment);
-//    return true;
 }
-
