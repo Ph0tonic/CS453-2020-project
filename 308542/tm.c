@@ -109,13 +109,13 @@ static inline void pause() {
 #define ADDED_REMOVED_FLAG 5
 
 struct link {
-    tx_t status_owner;     // Identifier of the lock owner
+    _Atomic(tx_t) status_owner;     // Identifier of the lock owner
+    _Atomic(int) status;            // Whether this blocks need to be added or removed in case of rollback and commit
 
     struct link *prev;     // Previous link in the chain
     struct link *next;     // Next link in the chain
 
     size_t size;           // Size of the segment
-    int status;            // Whether this blocks need to be added or removed in case of rollback and commit
 };
 
 /** Link reset.
@@ -153,8 +153,7 @@ static void link_remove(struct link *link) {
 
 // -------------------------------------------------------------------------- //
 
-
-#define BATCHER_TRANSACTION_NUMBER 8
+#define BATCHER_TRANSACTION_NUMBER 20
 static const tx_t read_only_tx  = UINTPTR_MAX - 1;
 
 struct batcher {
@@ -212,26 +211,22 @@ void batch_commit(struct region *region) {
     struct link *next_link = NULL;
     void *start = region->start;
 
+    atomic_thread_fence(memory_order_acquire);
     while (true) {
         next_link = link->next;
 
-        if (link->status_owner != 0 && link->status == REMOVED_FLAG) {
+        if (link->status_owner != 0 && (link->status == REMOVED_FLAG || link->status == ADDED_REMOVED_FLAG)) {
             // Free this block
             link_remove(link);
             free(link);
         } else {
-            link->status_owner = 0;
             link->status = DEFAULT_FLAG;
+            link->status_owner = 0;
 
             // Commit changes
             memcpy(start, ((char *) start) + link->size, link->size);
 
             // Reset locks
-            // for (int i=0;i<link->size;++i) {
-            //     if ((char*)start+2*link->size+i*sizeof(tx_t) != NULL) {
-            //         // printf("commit %d\n", i);
-            //     }
-            // }
             memset(((char *) start) + 2 * link->size, 0, link->size / region->align * sizeof(tx_t));
         }
 
@@ -242,9 +237,11 @@ void batch_commit(struct region *region) {
         link = next_link;
         start = (void *) (((char *) link) + region->delta_alloc);
     };
+
+    atomic_thread_fence(memory_order_release);
 }
 
-void leave(struct batcher *batcher, struct region* region) {
+void leave(struct batcher *batcher, struct region* region, tx_t tx) {
     pthread_mutex_lock(&(batcher->mutex));
     batcher->nb_entered--;
     // int d = batcher->nb_entered;
@@ -252,13 +249,13 @@ void leave(struct batcher *batcher, struct region* region) {
         if (batcher->nb_write_tx > 0) {
             batch_commit(region);
         } else {
-            printf("No commit needed\n");
+            // printf("No commit needed\n");
         }
         batcher->nb_write_tx = 0;
         batcher->counter = BATCHER_TRANSACTION_NUMBER;
         pthread_cond_broadcast(&(batcher->cond));
-        printf("Batch commited\n");
-    } else {
+        // printf("Batch commited\n");
+    } else if (tx != read_only_tx) {
         pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
     }
     pthread_mutex_unlock(&(batcher->mutex));
@@ -318,16 +315,18 @@ shared_t tm_create(size_t size, size_t align) {
     region->align_alloc = align_alloc;
     region->delta_alloc = (sizeof(struct link) + align_alloc - 1) / align_alloc * align_alloc;
     
-    printf("align %ld \n", align);
-    printf("align_alloc %ld \n", align_alloc);
-    printf("sizeof(struct link) %ld \n", sizeof(struct link));
-    printf("controle_size %ld \n", controle_size);
-    printf("delta_alloc %ld \n", region->delta_alloc);
-    printf("size %ld \n", size);
-    printf("getpagesize %d\n", getpagesize());
-    printf("sizeof char * %lu\n",  sizeof(char *));
-    printf("sizeof %lu\n",  sizeof(tx_t));
-    printf("sizeof atomic %lu\n",  sizeof(_Atomic(tx_t)));
+    // printf("align %ld \n", align);
+    // printf("align_alloc %ld \n", align_alloc);
+    // printf("sizeof(struct link) %ld \n", sizeof(struct link));
+    // printf("controle_size %ld \n", controle_size);
+    // printf("delta_alloc %ld \n", region->delta_alloc);
+    // printf("size %ld \n", size);
+    // printf("getpagesize %d\n", getpagesize());
+    // printf("sizeof char * %lu\n",  sizeof(char *));
+    // printf("sizeof %lu\n",  sizeof(tx_t));
+    // printf("sizeof atomic %lu\n",  sizeof(_Atomic(tx_t)));
+    // printf("sizeof atomic %lu\n",  sizeof(_Atomic(uintptr_t)));
+    // printf("sizeof atomic %lu\n",  sizeof(_Atomic(unsigned long long)));
     // return invalid_shared;
 
     return region;
@@ -382,11 +381,11 @@ size_t tm_align(shared_t shared) {
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
     tx_t tx = enter(&(((struct region *) shared)->batcher), is_ro);
-    if(tx == read_only_tx){
-        printf("Begin read only\n");
-    } else {
-        printf("Begin %lu\n", tx);
-    }
+    // if(tx == read_only_tx){
+    //     printf("Begin read only\n");
+    // } else {
+    //     printf("Begin %lu\n", tx);
+    // }
     return tx;
 }
 
@@ -409,29 +408,31 @@ void tm_rollback(shared_t shared, tx_t tx) {
         next_link = link->next;
         added = false;
 
-        if (link->status_owner == tx || link->status_owner == 0) {
-            if (link->status == ADDED_FLAG || link->status == ADDED_REMOVED_FLAG) {
+        tx_t owner = link->status_owner;
+        if (owner == tx || owner == 0) {
+            if (owner == tx && (link->status == ADDED_FLAG || link->status == ADDED_REMOVED_FLAG)) {
                 link_remove(link);
                 free(link);
                 added = true;
-            } else if (link->status_owner == tx) {
+            } else if (owner == tx) {
                 link->status = DEFAULT_FLAG;
                 link->status_owner = 0;
             }
 
             if (!added) {
-                tx_t volatile *controles = (tx_t volatile *) ((char *) start + 2 * link->size);
+                _Atomic(tx_t) volatile *controles = (_Atomic(tx_t) volatile *) ((char *) start + 2 * link->size);
                 size_t align = region->align;
                 size_t size = region->size;
                 size_t nb = link->size / region->align;
 
                 for (size_t i = 0; i < nb; ++i) {
                     if (controles[i] == tx) {
-                        printf("Unlock %ld\n", i);
+                        // printf("Unlock %ld\n", i);
                         memcpy(((char *) start) + i * align + size, ((char *) start) + i * align, align);
+                        controles[i] = 0;
                     }
-                    controles[i] = 0;
                 }
+                atomic_thread_fence(memory_order_release);
             }
         }
 
@@ -442,7 +443,7 @@ void tm_rollback(shared_t shared, tx_t tx) {
         link = next_link;
         start = (void *) (((char *) link) + region->delta_alloc);
     };
-    leave(&(region->batcher), region);
+    leave(&(region->batcher), region, tx);
     // printf("Rollback end\n");
 }
 
@@ -451,8 +452,8 @@ void tm_rollback(shared_t shared, tx_t tx) {
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t shared, tx_t tx as(unused)) {
-    leave(&((struct region *) shared)->batcher, (struct region *)shared);
+bool tm_end(shared_t shared, tx_t tx) {
+    leave(&((struct region *) shared)->batcher, (struct region *)shared, tx);
     return true;
 }
 
@@ -468,14 +469,15 @@ bool lock_words(struct region *region, tx_t tx, struct link *link, char* start, 
         bool res = atomic_compare_exchange_strong(controls + i, &previous, tx);
         if (!(res || previous == tx)) {
             if (i - index > 1) {
-                printf("Rollback i: %ld \t index: %ld\n", i-1, index);
+                // printf("Rollback i: %ld \t index: %ld\n", i-1, index);
                 memset((void *)(controls + index), 0, (i - index - 1) * sizeof(tx_t));
+                atomic_thread_fence(memory_order_release);
             }else {
-                printf("Unable to lock i: %ld \t index: %ld\n", i, index);
+                // printf("Unable to lock i: %ld \t index: %ld\n", i, index);
             }
             return false;
         } else {
-            printf("Lock %ld - %lu - %lu - %ld - %p\n", i, tx, size, nb, start);
+            // printf("Lock %ld - %lu - %lu - %ld - %p\n", i, tx, size, nb, start);
         }
     }
     return true;
@@ -558,7 +560,6 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
-    // printf("Alloc %d\n", size);
     struct region *region = (struct region *) shared;
 
     size_t align_alloc = region->align_alloc;
@@ -582,7 +583,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     *target = segment;
 
     // printf("Link %x\n", link);
-    // printf("Data %x\n", segment);
+    // printf("%lu Alloc %p\n", tx, segment);
     return success_alloc;
 }
 
@@ -596,9 +597,12 @@ bool tm_free(shared_t shared, tx_t tx, void *segment) {
     size_t delta_alloc = ((struct region *) shared)->delta_alloc;
     struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
 
+    atomic_thread_fence(memory_order_acquire);
     tx_t owner = link->status_owner;
     if (unlikely(owner != 0 && owner != tx)) {
-        printf("Unlikely lock free segment\n");
+        // __asm__ volatile ("int3;":::"memory");
+        // printf("%lu - owner %ld Unlikely lock free segment %p %d\n", tx, owner, segment, link->status);
+        tm_rollback(shared, tx);
         return false;
     }
 
