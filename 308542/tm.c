@@ -20,6 +20,7 @@
 #endif
 
 // External headers
+// #include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -101,12 +102,9 @@ static inline void pause() {
     ((type*) ((uintptr_t) ptr - offsetof(type, member)))
 
 #define DEFAULT_FLAG -1
-#define READ_FLAG 0
-#define WRITE_FLAG 1
-#define REMOVED_FLAG 2
-#define WRITE_REMOVE_FLAG 3
-#define ADDED_FLAG 4
-#define ADDED_REMOVED_FLAG 5
+#define REMOVED_FLAG 1
+#define ADDED_FLAG 2
+#define ADDED_REMOVED_FLAG 3
 
 #define BATCHER_TRANSACTION_NUMBER 8
 static const tx_t read_only_tx  = UINTPTR_MAX - 1;
@@ -197,40 +195,9 @@ tx_t enter(struct batcher *batcher, bool is_ro) {
     }
 }
 
-void leave(struct batcher *batcher, struct region* region, tx_t tx) {
-    // Acquire status lock
-    unsigned long ticket = atomic_fetch_add_explicit(&(batcher->take), 1ul, memory_order_relaxed);
-    while (atomic_load_explicit(&(batcher->pass), memory_order_relaxed) != ticket)
-        pause();
-    atomic_thread_fence(memory_order_acquire);
-
-    if (atomic_fetch_add_explicit(&batcher->nb_entered, -1ul, memory_order_relaxed) == 1ul) {
-        if (atomic_load_explicit(&(batcher->nb_write_tx), memory_order_relaxed) > 0) {
-            batch_commit(region);
-            // printf("batch commit\n");
-            atomic_store_explicit(&(batcher->nb_write_tx), 0, memory_order_relaxed);
-            atomic_store_explicit(&(batcher->counter), BATCHER_TRANSACTION_NUMBER, memory_order_relaxed);
-            atomic_fetch_add_explicit(&(batcher->epoch), 1ul, memory_order_relaxed);
-        }
-        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-    } else if (tx != read_only_tx) {
-        unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
-        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-
-        while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
-            pause();
-    } else {
-        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-        // printf("Readonly exit\n");
-    }
-}
-
 void batch_commit(struct region *region) {
     for (size_t i=0;i<region->index;++i) {
-        bool added = false;
         struct mapping_entry *mapping = region->mapping + i;
-        added = false;
-
         atomic_thread_fence(memory_order_acquire);
     
         if (mapping->status_owner != 0 && (mapping->status == REMOVED_FLAG || mapping->status == ADDED_REMOVED_FLAG)) {
@@ -254,8 +221,34 @@ void batch_commit(struct region *region) {
     atomic_thread_fence(memory_order_release);
 }
 
+void leave(struct batcher *batcher, struct region* region, tx_t tx) {
+    // Acquire status lock
+    unsigned long ticket = atomic_fetch_add_explicit(&(batcher->take), 1ul, memory_order_relaxed);
+    while (atomic_load_explicit(&(batcher->pass), memory_order_relaxed) != ticket)
+        pause();
+    atomic_thread_fence(memory_order_acquire);
+
+    if (atomic_fetch_add_explicit(&batcher->nb_entered, -1ul, memory_order_relaxed) == 1ul) {
+        if (atomic_load_explicit(&(batcher->nb_write_tx), memory_order_relaxed) > 0) {
+            batch_commit(region);
+            atomic_store_explicit(&(batcher->nb_write_tx), 0, memory_order_relaxed);
+            atomic_store_explicit(&(batcher->counter), BATCHER_TRANSACTION_NUMBER, memory_order_relaxed);
+            atomic_fetch_add_explicit(&(batcher->epoch), 1ul, memory_order_relaxed);
+        }
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+    } else if (tx != read_only_tx) {
+        unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+
+        while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
+            pause();
+    } else {
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+    }
+}
+
 struct mapping_entry *get_segment(const void *source, struct region *region, void **data_start) {
-    for (int i=0;i<region->index;++i) {
+    for (size_t i=0;i<region->index;++i) {
         *data_start = region->mapping[i].ptr;
         if (source >= *data_start && (char *) source < *(char **) data_start + region->mapping[i].size) {
             return region->mapping + i;
@@ -348,7 +341,6 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     return enter(&(((struct region *) shared)->batcher), is_ro);
 }
 
-//TODO: Implement
 void tm_rollback(shared_t shared, tx_t tx) {
     struct region *region = (struct region *)shared;
     unsigned long int index = region->index;
@@ -421,25 +413,6 @@ bool lock_words(struct region *region, tx_t tx, struct mapping_entry *mapping, c
     return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in a private region)
- * @return Whether the whole transaction can continue
-**/
-bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
-    if (likely(tx == read_only_tx)) {
-        // Read the data
-        memcpy(target, source, size);
-    } else {
-        tm_read_write(shared, tx, source, size, target);
-    }
-
-    return true;
-}
-
 void tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     void *data_start = NULL;
     struct mapping_entry *mapping = get_segment(source, shared, &data_start);
@@ -462,6 +435,25 @@ void tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, vo
 
     // Read the data
     memcpy(target, (char *) source + mapping->size, size);
+}
+
+/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in the shared region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in a private region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
+    if (likely(tx == read_only_tx)) {
+        // Read the data
+        memcpy(target, source, size);
+    } else {
+        tm_read_write(shared, tx, source, size, target);
+    }
+
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
