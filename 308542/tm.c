@@ -108,53 +108,17 @@ static inline void pause() {
 #define ADDED_FLAG 4
 #define ADDED_REMOVED_FLAG 5
 
-struct link {
+#define BATCHER_TRANSACTION_NUMBER 8
+static const tx_t read_only_tx  = UINTPTR_MAX - 1;
+static const tx_t destroy_tx  = UINTPTR_MAX - 2;
+
+struct mapping_entry {
+    void * ptr;
     _Atomic(tx_t) status_owner;     // Identifier of the lock owner
     _Atomic(int) status;            // Whether this blocks need to be added or removed in case of rollback and commit
 
-    struct link *prev;     // Previous link in the chain
-    struct link *next;     // Next link in the chain
-
     size_t size;           // Size of the segment
 };
-
-/** Link reset.
- * @param link Link to reset
-**/
-static void link_reset(struct link *link, size_t size) {
-    link->prev = link;
-    link->next = link;
-    link->size = size;
-    link->status = DEFAULT_FLAG;
-    link->status_owner = 0;
-}
-
-/** Link insertion before a "base" link.
- * @param link Link to insert
- * @param base Base link relative to which 'link' will be inserted
-**/
-static void link_insert(struct link *link, struct link *base) {
-    struct link *prev = base->prev;
-    link->prev = prev;
-    link->next = base;
-    base->prev = link;
-    prev->next = link;
-}
-
-/** Link removal.
- * @param link Link to remove
-**/
-static void link_remove(struct link *link) {
-    struct link *prev = link->prev;
-    struct link *next = link->next;
-    prev->next = next;
-    next->prev = prev;
-}
-
-// -------------------------------------------------------------------------- //
-
-#define BATCHER_TRANSACTION_NUMBER 8
-static const tx_t read_only_tx  = UINTPTR_MAX - 1;
 
 struct batcher {
     // pthread_mutex_t mutex;
@@ -166,18 +130,17 @@ struct batcher {
     atomic_ulong pass; // Ticket that acquires the lock
     atomic_ulong take; // Ticket the next thread takes
     atomic_ulong epoch;
-
 };
 
 struct region {
-    void *start;        // Start of the shared memory region
-    struct link allocs; // Allocated shared memory regions
     size_t size;        // Size of the shared memory region (in bytes)
     size_t align;       // Claimed alignment of the shared memory region (in bytes)
     size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-    size_t delta_alloc; // Space to add at the beginning of the segment for the link chain (in bytes)
-
+    
     struct batcher batcher;
+
+    struct mapping_entry *mapping;
+    atomic_ulong index;
 };
 
 // Return whether it's a success
@@ -244,12 +207,12 @@ void leave(struct batcher *batcher, struct region* region, tx_t tx) {
     if (atomic_fetch_add_explicit(&batcher->nb_entered, -1ul, memory_order_relaxed) == 1ul) {
         if (atomic_load_explicit(&(batcher->nb_write_tx), memory_order_relaxed) > 0) {
             batch_commit(region);
+            // printf("batch commit\n");
             atomic_store_explicit(&(batcher->nb_write_tx), 0, memory_order_relaxed);
             atomic_store_explicit(&(batcher->counter), BATCHER_TRANSACTION_NUMBER, memory_order_relaxed);
             atomic_fetch_add_explicit(&(batcher->epoch), 1ul, memory_order_relaxed);
         }
         atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-        // printf("batch commit\n");
     } else if (tx != read_only_tx) {
         unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
         atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
@@ -260,85 +223,45 @@ void leave(struct batcher *batcher, struct region* region, tx_t tx) {
         atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
         // printf("Readonly exit\n");
     }
-    
-    // Release status lock
-    
-
-    // pthread_mutex_lock(&(batcher->mutex));
-    // batcher->nb_entered--;
-    // unsigned long epoch = batcher->epoch;
-
-    // // int d = batcher->nb_entered;
-    // if (batcher->nb_entered == 0) {
-    //     if (batcher->nb_write_tx > 0) {
-    //         batch_commit(region);
-    //     }
-    //     batcher->nb_write_tx = 0;
-    //     batcher->counter = BATCHER_TRANSACTION_NUMBER;
-    //     pthread_cond_broadcast(&(batcher->cond));
-    //     // printf("Batch commited\n");
-    // } else if (tx != read_only_tx) {
-    //     pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
-    // }
-    // pthread_mutex_unlock(&(batcher->mutex));
 }
 
 void batch_commit(struct region *region) {
-    struct link *allocs = &(region->allocs);
+    for (size_t i=0;i<region->index;++i) {
+        bool added = false;
+        struct mapping_entry *mapping = region->mapping + i;
+        added = false;
 
-    // Unlock each of our block
-    struct link *link = &region->allocs;
-    struct link *next_link = NULL;
-    void *start = region->start;
-
-    atomic_thread_fence(memory_order_acquire);
-    while (true) {
-        next_link = link->next;
-
-        if (link->status_owner != 0 && (link->status == REMOVED_FLAG || link->status == ADDED_REMOVED_FLAG)) {
+        atomic_thread_fence(memory_order_acquire);
+    
+        if (mapping->status_owner != 0 && (mapping->status == REMOVED_FLAG || mapping->status == ADDED_REMOVED_FLAG)) {
             // Free this block
-            link_remove(link);
-            free(link);
-        } else {
-            link->status = DEFAULT_FLAG;
-            link->status_owner = 0;
+            unsigned long int previous = i+1;
+            if (atomic_compare_exchange_strong(&(region->index), &previous, i)) {
+                free(mapping->ptr);
+            }
+        } else if (mapping->status_owner != destroy_tx) {
+            mapping->status = DEFAULT_FLAG;
+            mapping->status_owner = 0;
 
             // Commit changes
-            memcpy(start, ((char *) start) + link->size, link->size);
+            memcpy(mapping->ptr, ((char *) mapping->ptr) + mapping->size, mapping->size);
 
             // Reset locks
-            memset(((char *) start) + 2 * link->size, 0, link->size / region->align * sizeof(tx_t));
+            memset(((char *) mapping->ptr) + 2 * mapping->size, 0, mapping->size / region->align * sizeof(tx_t));
         }
-
-        if (next_link == allocs) {
-            break;
-        }
-
-        link = next_link;
-        start = (void *) (((char *) link) + region->delta_alloc);
     };
 
     atomic_thread_fence(memory_order_release);
 }
 
-struct link *get_segment(const void *source, struct region *region, void **data_start) {
-    struct link *allocs = &(region->allocs);
-
-    *data_start = region->start;
-    struct link *link = &region->allocs;
-
-    while (true) {
-        if (source >= *data_start && (char *) source < *(char **) data_start + link->size) {
-            return link;
+struct mapping_entry *get_segment(const void *source, struct region *region, void **data_start) {
+    for (int i=0;i<region->index;++i) {
+        *data_start = region->mapping[i].ptr;
+        if (source >= *data_start && (char *) source < *(char **) data_start + region->mapping[i].size) {
+            return region->mapping + i;
         }
-
-        link = link->next;
-        *data_start = (void *) ((char *) link + region->delta_alloc);
-
-        if (link == allocs) {
-            return NULL; // Not found
-        }
-    };
+    }
+    return NULL;
 }
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -355,7 +278,12 @@ shared_t tm_create(size_t size, size_t align) {
     size_t align_alloc = align < sizeof(void *) ? sizeof(void *) : align; // Also satisfy alignment requirement of 'struct link'
     size_t controle_size = size / align * sizeof(tx_t);
 
-    if (unlikely(posix_memalign(&(region->start), align_alloc, 2 * size + controle_size) != 0)) {
+    region->index = 1;
+    region->mapping = malloc(getpagesize());
+    memset(region->mapping, 0, getpagesize());
+    region->mapping->size = size;
+
+    if (unlikely(posix_memalign(&(region->mapping->ptr), align_alloc, 2 * size + controle_size) != 0)) {
         free(region);
         return invalid_shared;
     }
@@ -366,29 +294,11 @@ shared_t tm_create(size_t size, size_t align) {
     }
 
     // Do we store a pointer to the control location
-    memset(region->start, 0, 2 * size + controle_size);
-    link_reset(&(region->allocs), size);
-
-    region->allocs.size = size;
+    memset(region->mapping->ptr, 0, 2 * size + controle_size);
     region->size = size;
     region->align = align;
     region->align_alloc = align_alloc;
-    region->delta_alloc = (sizeof(struct link) + align_alloc - 1) / align_alloc * align_alloc;
     
-    // printf("align %ld \n", align);
-    // printf("align_alloc %ld \n", align_alloc);
-    // printf("sizeof(struct link) %ld \n", sizeof(struct link));
-    // printf("controle_size %ld \n", controle_size);
-    // printf("delta_alloc %ld \n", region->delta_alloc);
-    // printf("size %ld \n", size);
-    // printf("getpagesize %d\n", getpagesize());
-    // printf("sizeof char * %lu\n",  sizeof(char *));
-    // printf("sizeof %lu\n",  sizeof(tx_t));
-    // printf("sizeof atomic %lu\n",  sizeof(_Atomic(tx_t)));
-    // printf("sizeof atomic %lu\n",  sizeof(_Atomic(uintptr_t)));
-    // printf("sizeof atomic %lu\n",  sizeof(_Atomic(unsigned long long)));
-    // return invalid_shared;
-
     return region;
 }
 
@@ -397,17 +307,12 @@ shared_t tm_create(size_t size, size_t align) {
 **/
 void tm_destroy(shared_t shared) {
     struct region *region = (struct region *) shared;
-    struct link *allocs = &(region->allocs);
-    while (true) { // Free allocated segments
-        struct link *alloc = allocs->next;
-        if (alloc == allocs)
-            break;
-        link_remove(alloc);
-        free(alloc);
+    
+    for (size_t i=0;i<region->index;++i) {
+        free(region->mapping[i].ptr);
     }
-    free(region->start);
+    free(region->mapping);
     free(region);
-    // lock_cleanup(&(region->lock));
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -415,7 +320,7 @@ void tm_destroy(shared_t shared) {
  * @return Start address of the first allocated segment
 **/
 void *tm_start(shared_t shared) {
-    return ((struct region *) shared)->start;
+    return ((struct region *) shared)->mapping->ptr;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -440,69 +345,46 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
-    tx_t tx = enter(&(((struct region *) shared)->batcher), is_ro);
-    // if(tx == read_only_tx){
-    //     printf("Begin read only\n");
-    // } else {
-    //     printf("Begin %lu\n", tx);
-    // }
-    return tx;
+    return enter(&(((struct region *) shared)->batcher), is_ro);
 }
 
 //TODO: Implement
 void tm_rollback(shared_t shared, tx_t tx) {
-    struct region *region = (struct region *) shared;
-    struct link *allocs = &(region->allocs);
-
-    // TODO: DEBUG line - print
-    // __asm__ volatile ("int3;":::"memory");
-
-    // Reverse each of our block
-    struct link *link = &region->allocs;
-    struct link *next_link = NULL;
-    void *start = region->start;
-    bool added = false;
-
-    // Free allocated segments
-    while (true) {
-        next_link = link->next;
+    struct region *region = (struct region *)shared;
+    unsigned long int index = region->index;
+    for (size_t i=0;i<index;++i) {
+        bool added = false;
+        struct mapping_entry *mapping = region->mapping + i;
         added = false;
 
-        tx_t owner = link->status_owner;
+        tx_t owner = mapping->status_owner;
         if (owner == tx || owner == 0) {
-            if (owner == tx && (link->status == ADDED_FLAG || link->status == ADDED_REMOVED_FLAG)) {
-                link_remove(link);
-                free(link);
+            if (owner == tx && (mapping->status == ADDED_FLAG || mapping->status == ADDED_REMOVED_FLAG)) {
+                mapping->status_owner = destroy_tx;
                 added = true;
             } else if (owner == tx) {
-                link->status = DEFAULT_FLAG;
-                link->status_owner = 0;
+                mapping->status_owner = 0;
+                mapping->status = DEFAULT_FLAG;
             }
 
             if (!added) {
-                _Atomic(tx_t) volatile *controles = (_Atomic(tx_t) volatile *) ((char *) start + 2 * link->size);
+                _Atomic(tx_t) volatile *controles = (_Atomic(tx_t) volatile *) ((char *)mapping->ptr + 2 * mapping->size);
                 size_t align = region->align;
                 size_t size = region->size;
-                size_t nb = link->size / region->align;
+                size_t nb = mapping->size / region->align;
 
                 for (size_t i = 0; i < nb; ++i) {
                     if (controles[i] == tx) {
                         // printf("Unlock %ld\n", i);
-                        memcpy(((char *) start) + i * align + size, ((char *) start) + i * align, align);
+                        memcpy(((char *) mapping->ptr) + i * align + size, ((char *) mapping->ptr) + i * align, align);
                         controles[i] = 0;
                     }
                 }
                 atomic_thread_fence(memory_order_release);
             }
         }
-
-        if (next_link == allocs) {
-            break;
-        }
-
-        link = next_link;
-        start = (void *) (((char *) link) + region->delta_alloc);
     };
+    // printf("Rollback\n");
     leave(&(region->batcher), region, tx);
     // printf("Rollback end\n");
 }
@@ -517,11 +399,11 @@ bool tm_end(shared_t shared, tx_t tx) {
     return true;
 }
 
-bool lock_words(struct region *region, tx_t tx, struct link *link, char* start, void *target, size_t size) {
+bool lock_words(struct region *region, tx_t tx, struct mapping_entry *mapping, char* start, void *target, size_t size) {
     size_t index = ((char *) target - start) / region->align;
     size_t nb = size / region->align;
-    // Not technicaly correct TODO: we should add some alignement between the data and the control structure
-    _Atomic(tx_t) volatile *controls = (_Atomic(tx_t)volatile *) (start + link->size * 2);
+
+    _Atomic(tx_t) volatile *controls = (_Atomic(tx_t)volatile *) (start + mapping->size * 2);
     // volatile tx_t *controls = (volatile tx_t *) (start + link->size * 2);
 
     for (size_t i = index; i < index + nb; ++i) {
@@ -560,29 +442,27 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
 void tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     void *data_start = NULL;
-    struct link *link = get_segment(source, shared, &data_start);
+    struct mapping_entry *mapping = get_segment(source, shared, &data_start);
 
     struct region *region = (struct region *) shared;
     size_t index = ((char *) source - (char*) data_start) / region->align;
     size_t nb = size / region->align;
     size_t align = region->align;
 
-    // Not technical correct TODO: we should add some alignement between the data and the control structure
-    _Atomic(tx_t) volatile *controls = (_Atomic(tx_t)volatile *) (data_start + link->size * 2);
+    _Atomic(tx_t) volatile *controls = (_Atomic(tx_t)volatile *) (data_start + mapping->size * 2);
     // volatile tx_t *controls = (volatile tx_t *) (data_start + link->size * 2);
 
     for (size_t i = index; i < index + nb; ++i) {
         if (controls[i] == tx) {
-            memcpy(target, (char *) source + i * align + link->size, align);
+            memcpy(target, (char *) source + i * align + mapping->size, align);
         } else {
             memcpy(target, (char *) source + i * align, align);
         }
     }
 
     // Read the data
-    memcpy(target, (char *) source + link->size, size);
+    memcpy(target, (char *) source + mapping->size, size);
 }
-
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
@@ -592,17 +472,17 @@ void tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, vo
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source, size_t size, void *target) {
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     struct region *region = (struct region *) shared;
     void *data_start = NULL;
-    struct link *link = get_segment(target, region, &data_start);
-
-    if (!lock_words(region, tx, link, data_start, target, size)) {
+    struct mapping_entry *mapping = get_segment(target, region, &data_start);
+    
+    if (mapping == NULL || !lock_words(region, tx, mapping, data_start, target, size)) {
         tm_rollback(shared, tx);
         return false;
     }
 
-    memcpy((char *) target + link->size, source, size);
+    memcpy((char *) target + mapping->size, source, size);
     return true;
 }
 
@@ -616,25 +496,21 @@ bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     struct region *region = (struct region *) shared;
 
+    unsigned long int index = atomic_fetch_add_explicit(&(region->index), 1ul, memory_order_relaxed);
+
+    struct mapping_entry *mapping = region->mapping + index;
+    mapping->size = size;
+    mapping->status_owner = tx;
+    mapping->status = ADDED_FLAG;
+
     size_t align_alloc = region->align_alloc;
-    size_t delta_alloc = region->delta_alloc;
     size_t controle_size = size / region->align * sizeof(tx_t);
-    void *segment;
-    if (unlikely(posix_memalign(&segment, align_alloc,
-                                delta_alloc + 2 * size + controle_size) !=
-                 0)) // Allocation failed
+    
+    if (unlikely(posix_memalign(&mapping->ptr, align_alloc, 2 * size + controle_size) != 0)) // Allocation failed
         return nomem_alloc;
 
-    // TODO: See with link_init() method
-    struct link *link = segment;
-    link->size = size;
-    link->status_owner = tx;
-    link->status = ADDED_FLAG;
-
-    link_insert((struct link *) segment, &(((struct region *) shared)->allocs));
-    segment = (void *) ((uintptr_t) segment + delta_alloc);
-    memset(segment, 0, 2 * size + controle_size);
-    *target = segment;
+    memset(mapping->ptr, 0, 2 * size + controle_size);
+    *target = mapping->ptr;
 
     // printf("Link %x\n", link);
     // printf("%lu Alloc %p\n", tx, segment);
@@ -648,21 +524,22 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared, tx_t tx, void *segment) {
-    size_t delta_alloc = ((struct region *) shared)->delta_alloc;
-    struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
-
+    void *data_start = NULL;
+    
+    struct mapping_entry *mapping = get_segment(segment, shared, &data_start);
     tx_t previous = 0;
-    if (!(atomic_compare_exchange_strong(&link->status_owner, &previous, tx) || previous == tx)) {
+
+    if (mapping == NULL || !(atomic_compare_exchange_strong(&mapping->status_owner, &previous, tx) || previous == tx)) {
         // __asm__ volatile ("int3;":::"memory");
         // printf("%lu - owner %ld Unlikely lock free segment %p %d\n", tx, owner, segment, link->status);
         tm_rollback(shared, tx);
         return false;
     }
 
-    if (link->status == ADDED_FLAG) {
-        link->status = ADDED_REMOVED_FLAG;
+    if (mapping->status == ADDED_FLAG) {
+        mapping->status = ADDED_REMOVED_FLAG;
     } else {
-        link->status = REMOVED_FLAG;
+        mapping->status = REMOVED_FLAG;
     }
 
     return true;
