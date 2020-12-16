@@ -153,15 +153,20 @@ static void link_remove(struct link *link) {
 
 // -------------------------------------------------------------------------- //
 
-#define BATCHER_TRANSACTION_NUMBER 20
+#define BATCHER_TRANSACTION_NUMBER 8
 static const tx_t read_only_tx  = UINTPTR_MAX - 1;
 
 struct batcher {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    uint32_t volatile counter;
-    uint32_t volatile nb_entered;
-    uint32_t volatile nb_write_tx;
+    // pthread_mutex_t mutex;
+    // pthread_cond_t cond;
+    atomic_ulong counter;
+    atomic_ulong nb_entered;
+    atomic_ulong nb_write_tx;
+
+    atomic_ulong pass; // Ticket that acquires the lock
+    atomic_ulong take; // Ticket the next thread takes
+    atomic_ulong epoch;
+
 };
 
 struct region {
@@ -180,27 +185,102 @@ bool init_batcher(struct batcher *batcher) {
     batcher->counter = BATCHER_TRANSACTION_NUMBER;
     batcher->nb_entered = 0;
     batcher->nb_write_tx = 0;
-    if (pthread_cond_init(&(batcher->cond), NULL) != 0) {
-        return false;
-    }
-    return pthread_mutex_init(&(batcher->mutex), NULL) == 0;
+
+    batcher->pass = 0;
+    batcher->take = 0;
+    batcher->epoch = 0;
+
+    return true;
 }
 
 tx_t enter(struct batcher *batcher, bool is_ro) {
-    tx_t tx = read_only_tx;
-    // printf("Enter\n");
-    pthread_mutex_lock(&(batcher->mutex));
-    if (!is_ro) {
-        while (batcher->counter == 0) {
-            pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
+    if (is_ro) {
+        // Acquire status lock
+        unsigned long ticket = atomic_fetch_add_explicit(&(batcher->take), 1ul, memory_order_relaxed);
+        while (atomic_load_explicit(&(batcher->pass), memory_order_relaxed) != ticket)
+            pause();
+        atomic_thread_fence(memory_order_acquire);
+
+        atomic_fetch_add_explicit(&(batcher->nb_entered), 1ul, memory_order_relaxed);
+
+        // Release status lock
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+        // printf("enter readonly\n");
+        return read_only_tx;
+    } else {
+        while(true) {
+            unsigned long ticket = atomic_fetch_add_explicit(&(batcher->take), 1ul, memory_order_relaxed);
+            while (atomic_load_explicit(&(batcher->pass), memory_order_relaxed) != ticket)
+                pause();
+            atomic_thread_fence(memory_order_acquire);
+
+            // Acquire status lock
+            if (batcher->counter == 0) {
+                unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
+                atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+
+                while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
+                    pause();
+                atomic_thread_fence(memory_order_acquire);
+            } else {
+                batcher->counter--;
+                break;
+            }
         }
-        --batcher->counter;
-        tx = ++batcher->nb_write_tx;
+        atomic_fetch_add_explicit(&(batcher->nb_entered), 1ul, memory_order_relaxed);
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+        // printf("enter write\n");
+        return atomic_fetch_add_explicit(&(batcher->nb_write_tx), 1ul, memory_order_relaxed) + 1ul;
     }
-    batcher->nb_entered++;
-    // printf("Enter %d\n", batcher->nb_entered);
-    pthread_mutex_unlock(&(batcher->mutex));
-    return tx;
+}
+
+void leave(struct batcher *batcher, struct region* region, tx_t tx) {
+    // Acquire status lock
+    unsigned long ticket = atomic_fetch_add_explicit(&(batcher->take), 1ul, memory_order_relaxed);
+    while (atomic_load_explicit(&(batcher->pass), memory_order_relaxed) != ticket)
+        pause();
+    atomic_thread_fence(memory_order_acquire);
+
+    if (atomic_fetch_add_explicit(&batcher->nb_entered, -1ul, memory_order_relaxed) == 1ul) {
+        if (atomic_load_explicit(&(batcher->nb_write_tx), memory_order_relaxed) > 0) {
+            batch_commit(region);
+            atomic_store_explicit(&(batcher->nb_write_tx), 0, memory_order_relaxed);
+            atomic_store_explicit(&(batcher->counter), BATCHER_TRANSACTION_NUMBER, memory_order_relaxed);
+            atomic_fetch_add_explicit(&(batcher->epoch), 1ul, memory_order_relaxed);
+        }
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+        // printf("batch commit\n");
+    } else if (tx != read_only_tx) {
+        unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+
+        while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
+            pause();
+    } else {
+        atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+        // printf("Readonly exit\n");
+    }
+    
+    // Release status lock
+    
+
+    // pthread_mutex_lock(&(batcher->mutex));
+    // batcher->nb_entered--;
+    // unsigned long epoch = batcher->epoch;
+
+    // // int d = batcher->nb_entered;
+    // if (batcher->nb_entered == 0) {
+    //     if (batcher->nb_write_tx > 0) {
+    //         batch_commit(region);
+    //     }
+    //     batcher->nb_write_tx = 0;
+    //     batcher->counter = BATCHER_TRANSACTION_NUMBER;
+    //     pthread_cond_broadcast(&(batcher->cond));
+    //     // printf("Batch commited\n");
+    // } else if (tx != read_only_tx) {
+    //     pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
+    // }
+    // pthread_mutex_unlock(&(batcher->mutex));
 }
 
 void batch_commit(struct region *region) {
@@ -239,26 +319,6 @@ void batch_commit(struct region *region) {
     };
 
     atomic_thread_fence(memory_order_release);
-}
-
-void leave(struct batcher *batcher, struct region* region, tx_t tx) {
-    pthread_mutex_lock(&(batcher->mutex));
-    batcher->nb_entered--;
-    // int d = batcher->nb_entered;
-    if (batcher->nb_entered == 0) {
-        if (batcher->nb_write_tx > 0) {
-            batch_commit(region);
-        } else {
-            // printf("No commit needed\n");
-        }
-        batcher->nb_write_tx = 0;
-        batcher->counter = BATCHER_TRANSACTION_NUMBER;
-        pthread_cond_broadcast(&(batcher->cond));
-        // printf("Batch commited\n");
-    } else if (tx != read_only_tx) {
-        pthread_cond_wait(&(batcher->cond), &(batcher->mutex));
-    }
-    pthread_mutex_unlock(&(batcher->mutex));
 }
 
 struct link *get_segment(const void *source, struct region *region, void **data_start) {
@@ -472,12 +532,8 @@ bool lock_words(struct region *region, tx_t tx, struct link *link, char* start, 
                 // printf("Rollback i: %ld \t index: %ld\n", i-1, index);
                 memset((void *)(controls + index), 0, (i - index - 1) * sizeof(tx_t));
                 atomic_thread_fence(memory_order_release);
-            }else {
-                // printf("Unable to lock i: %ld \t index: %ld\n", i, index);
             }
             return false;
-        } else {
-            // printf("Lock %ld - %lu - %lu - %ld - %p\n", i, tx, size, nb, start);
         }
     }
     return true;
@@ -492,43 +548,41 @@ bool lock_words(struct region *region, tx_t tx, struct link *link, char* start, 
  * @return Whether the whole transaction can continue
 **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
-    
-    // VERSION 2
-    if (tx == read_only_tx) {
+    if (likely(tx == read_only_tx)) {
         // Read the data
         memcpy(target, source, size);
     } else {
-        void *data_start = NULL;
-        struct link *link = get_segment(source, shared, &data_start);
-
-        struct region *region = (struct region *) shared;
-        size_t index = ((char *) source - (char*) data_start) / region->align;
-        size_t nb = size / region->align;
-        size_t align = region->align;
-
-        // Not technical correct TODO: we should add some alignement between the data and the control structure
-        _Atomic(tx_t) volatile *controls = (_Atomic(tx_t)volatile *) (data_start + link->size * 2);
-        // volatile tx_t *controls = (volatile tx_t *) (data_start + link->size * 2);
-
-        for (size_t i = index; i < index + nb; ++i) {
-            if (controls[i] == tx) {
-                memcpy(target, (char *) source + i * align + link->size, align);
-            } else {
-                memcpy(target, (char *) source + i * align, align);
-            }
-        }
-
-        // if (!lock_words(shared, tx, link, data_start, source, size)) {
-        //     tm_rollback(shared, tx);
-        //     return false;
-        // }
-
-        // Read the data
-        memcpy(target, (char *) source + link->size, size);
+        tm_read_write(shared, tx, source, size, target);
     }
 
     return true;
 }
+
+void tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
+    void *data_start = NULL;
+    struct link *link = get_segment(source, shared, &data_start);
+
+    struct region *region = (struct region *) shared;
+    size_t index = ((char *) source - (char*) data_start) / region->align;
+    size_t nb = size / region->align;
+    size_t align = region->align;
+
+    // Not technical correct TODO: we should add some alignement between the data and the control structure
+    _Atomic(tx_t) volatile *controls = (_Atomic(tx_t)volatile *) (data_start + link->size * 2);
+    // volatile tx_t *controls = (volatile tx_t *) (data_start + link->size * 2);
+
+    for (size_t i = index; i < index + nb; ++i) {
+        if (controls[i] == tx) {
+            memcpy(target, (char *) source + i * align + link->size, align);
+        } else {
+            memcpy(target, (char *) source + i * align, align);
+        }
+    }
+
+    // Read the data
+    memcpy(target, (char *) source + link->size, size);
+}
+
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
@@ -597,16 +651,13 @@ bool tm_free(shared_t shared, tx_t tx, void *segment) {
     size_t delta_alloc = ((struct region *) shared)->delta_alloc;
     struct link *link = (void *) ((uintptr_t) segment - delta_alloc);
 
-    atomic_thread_fence(memory_order_acquire);
-    tx_t owner = link->status_owner;
-    if (unlikely(owner != 0 && owner != tx)) {
+    tx_t previous = 0;
+    if (!(atomic_compare_exchange_strong(&link->status_owner, &previous, tx) || previous == tx)) {
         // __asm__ volatile ("int3;":::"memory");
         // printf("%lu - owner %ld Unlikely lock free segment %p %d\n", tx, owner, segment, link->status);
         tm_rollback(shared, tx);
         return false;
     }
-
-    link->status_owner = tx;
 
     if (link->status == ADDED_FLAG) {
         link->status = ADDED_REMOVED_FLAG;
