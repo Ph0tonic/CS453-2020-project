@@ -154,7 +154,7 @@ tx_t enter(struct batcher *batcher, bool is_ro) {
 
         // Release status lock
         atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-        
+
         // printf("enter read\n");
         return read_only_tx;
     } else {
@@ -190,15 +190,15 @@ tx_t enter(struct batcher *batcher, bool is_ro) {
 
 void batch_commit(struct region *region) {
     atomic_thread_fence(memory_order_acquire);
-    
+
     for (size_t i = region->index - 1ul; i < region->index; --i) {
         struct mapping_entry *mapping = region->mapping + i;
 
         if (mapping->status_owner == destroy_tx ||
             (mapping->status_owner != 0 && (
-                mapping->status == REMOVED_FLAG || mapping->status == ADDED_REMOVED_FLAG)
+                    mapping->status == REMOVED_FLAG || mapping->status == ADDED_REMOVED_FLAG)
             )
-        ) {
+                ) {
             // Free this block
             unsigned long int previous = i + 1;
             if (atomic_compare_exchange_weak(&(region->index), &previous, i)) {
@@ -276,7 +276,7 @@ shared_t tm_create(size_t size, size_t align) {
     if (unlikely(!region)) {
         return invalid_shared;
     }
-    
+
     size_t align_alloc = align < sizeof(void *) ? sizeof(void *) : align;
     size_t control_size = size / align_alloc * sizeof(tx_t);
 
@@ -408,9 +408,10 @@ bool lock_words(struct region *region, tx_t tx, struct mapping_entry *mapping, v
     for (size_t i = 0; i < nb; ++i) {
         tx_t previous = 0;
         tx_t previously_read = 0ul - tx;
-        if (!(atomic_compare_exchange_strong_explicit(controls + i, &previous, tx, memory_order_acquire, memory_order_relaxed) ||
-            previous == tx ||
-            atomic_compare_exchange_strong(controls + i, &previously_read, tx))) {
+        if (!(atomic_compare_exchange_strong_explicit(controls + i, &previous, tx, memory_order_acquire,
+                                                      memory_order_relaxed) ||
+              previous == tx ||
+              atomic_compare_exchange_strong(controls + i, &previously_read, tx))) {
             // printf("Unable to lock %lu - %lu --- %lu %lu %lu\n", tx, i+index, previous, previously_read, 0ul - tx);
 
             if (i > 1) {
@@ -443,14 +444,15 @@ bool tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, vo
     // Read the data
     for (size_t i = 0; i < nb; ++i) {
         tx_t no_owner = 0;
-        tx_t owner = atomic_load(controls+i);
+        tx_t owner = atomic_load(controls + i);
         if (owner == tx) {
-            memcpy(((char *)target) + i * align, ((char *) source) + i * align + mapping->size, align);
-        } else if (atomic_compare_exchange_strong(controls + i, &no_owner, 0ul - tx) || 
-            no_owner == 0ul - tx || no_owner == MULTIPLE_READERS ||
-            (no_owner > MULTIPLE_READERS && atomic_compare_exchange_strong(controls+i, &no_owner, MULTIPLE_READERS))
-        ) {
-            memcpy(((char *)target) + i * align, ((char *) source) + i * align, align);
+            memcpy(((char *) target) + i * align, ((char *) source) + i * align + mapping->size, align);
+        } else if (atomic_compare_exchange_strong(controls + i, &no_owner, 0ul - tx) ||
+                   no_owner == 0ul - tx || no_owner == MULTIPLE_READERS ||
+                   (no_owner > MULTIPLE_READERS &&
+                    atomic_compare_exchange_strong(controls + i, &no_owner, MULTIPLE_READERS))
+                ) {
+            memcpy(((char *) target) + i * align, ((char *) source) + i * align, align);
         } else {
             tm_rollback(region, tx);
             return false;
@@ -538,11 +540,11 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared, tx_t tx, void *segment) {
-    struct mapping_entry *mapping = get_segment((struct region *)shared ,segment);
-    
+    struct mapping_entry *mapping = get_segment((struct region *) shared, segment);
+
     tx_t previous = 0;
     if (mapping == NULL || !(atomic_compare_exchange_strong(&mapping->status_owner, &previous, tx) || previous == tx)) {
-        tm_rollback((struct region*)shared, tx);
+        tm_rollback((struct region *) shared, tx);
         return false;
     }
 
