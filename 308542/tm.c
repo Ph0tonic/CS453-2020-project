@@ -97,7 +97,7 @@ static inline void pause() {
 #define ADDED_FLAG 2
 #define ADDED_REMOVED_FLAG 3
 
-#define BATCHER_NB_TX 8ul
+#define BATCHER_NB_TX 12ul
 #define MULTIPLE_READERS UINTPTR_MAX - BATCHER_NB_TX
 
 static const tx_t read_only_tx = UINTPTR_MAX - 1ul;
