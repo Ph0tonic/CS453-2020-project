@@ -296,7 +296,7 @@ public:
         for (size_t cntr = 0; cntr < nbtxperwrk; ++cntr) {
             if (long_dist(engine)) { // Do a long transaction
                 if (unlikely(!long_tx(count)))
-                    return "Violated isolation or atomicity";
+                    return "Violated isolation or atomicity koko";
             } else if (alloc_dist(engine)) { // Do an allocation transaction
                 alloc_tx(alloc_trigger(engine));
             } else { // Do a short transaction
@@ -307,7 +307,7 @@ public:
         { // Last long transaction
             size_t dummy;
             if (!long_tx(dummy))
-                return "Violated isolation or atomicity";
+                return "Violated isolation or atomicity okok";
         }
         return nullptr;
     }
@@ -327,7 +327,7 @@ public:
             if (unlikely(!correct)) {
                 barrier.sync();
                 barrier.sync();
-                return "Violated consistency";
+                return "Violated consistency 1st";
             }
         }
         barrier.sync();
@@ -346,7 +346,7 @@ public:
             });
             if (unlikely(!correct)) {
                 barrier.sync();
-                return "Violated consistency, isolation or atomicity";
+                return "Violated consistency, isolation or atomicity middle";
             }
         }
         barrier.sync();
@@ -356,7 +356,7 @@ public:
                 return counter == 0;
             });
             if (unlikely(!correct))
-                return "Violated consistency";
+                return "Violated consistency read";
         }
         return nullptr;
     }
