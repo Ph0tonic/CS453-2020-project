@@ -1,5 +1,11 @@
 # CS-453 - Course project
 
+This project's aim was to develop  a small transactional memory lib. The one, implemented in folder `308542` has a speed up of 6 compare to the reference version which use a single read-write-lock.
+
+To reach this speed-up, I used a custom spin-lock instead of a condition variable and use the concept of batcher to increase the speed of the read-only transactions.
+
+## Description
+
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2020).
 
 The description includes:
